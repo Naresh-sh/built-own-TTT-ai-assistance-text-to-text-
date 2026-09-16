@@ -1,0 +1,733 @@
+/*
+      ================================================================
+      ESP32 AI ASSISTANT - U8G2 FIRMWARE (SH1106 / SSD1306)
+      Changes in this version:
+        - Top status bar made shorter (8px instead of 12px)
+        - Prompt box is now dynamic height: starts as a single thin
+          line and grows (up to 3 lines) as you type more text
+        - AI answers are longer (max_tokens 350 -> 900)
+        - Answer scrolling is now smooth (pixel-level animated
+          scroll instead of jumping 3 lines at a time), with a
+          small scrollbar on the right edge
+      ================================================================
+      Hardware Pin Mapping:
+        Display Pin   ->  ESP32 GPIO
+        -----------       ----------
+        GND           ->  GND
+        VCC           ->  3.3V (ya 5V/VIN)
+        SCK (CLK)     ->  GPIO 18
+        SDA (MOSI)    ->  GPIO 23
+        RES (Reset)   ->  GPIO 4
+        DC  (Data/Cmd)->  GPIO 2
+        CS  (Chip Sel)->  GPIO 5
+
+      Keyboard Pins:
+        Rows (3)      ->  GPIO 14, 13, 12
+        Cols (10)     ->  GPIO 19, 15, 17, 16, 22, 21, 32, 33, 25, 27
+        Space switch  ->  GPIO 34 (external 10k pull-up to 3.3V)
+      ================================================================
+*/
+
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+#include <U8g2lib.h>
+#include <SPI.h>
+#include <Preferences.h>
+#include <time.h>
+#include <math.h>
+
+// ================================================================
+// SECTION 1: CONFIG - fill these in before uploading
+// ================================================================
+const char* DEFAULT_SSID     = "node";       // <-- apne hotspot ka exact naam
+const char* DEFAULT_PASSWORD = "password";   // <-- apne hotspot ka exact password
+const char* OPENROUTER_KEY   = "";    // enter your api key.
+const char* MODEL_NAME       = "openrouter/free";
+
+const char* OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions";
+const long GMT_OFFSET_SEC = 5 * 3600 + 1800;  // IST (UTC+5:30)
+
+// ================================================================
+// SECTION 2: HARDWARE PINS & U8G2 INITIALIZATION
+// ================================================================
+#define OLED_CLK 18   // SCK
+#define OLED_MOSI 23  // SDA (MOSI)
+#define OLED_CS 5     // CS
+#define OLED_DC 2     // DC
+#define OLED_RESET 4  // RES
+
+// U8g2 SH1106 128x64 4-Wire Software SPI
+U8G2_SH1106_128X64_NONAME_F_4W_SW_SPI u8g2(U8G2_R0, OLED_CLK, OLED_MOSI, OLED_CS, OLED_DC, OLED_RESET);
+
+// Keyboard Matrix Pins
+const int ROW_PINS[3] = { 14, 13, 12 };
+const int COL_PINS[10] = { 19, 15, 17, 16, 22, 21, 32, 33, 25, 27 };
+
+char keyMap[3][10] = {
+  { 'z', 'x', 'c', 'v', 'b', 'n', 'm', ',', '.', '\n' },  // Row 0
+  { 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p' },   // Row 1
+  { 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', '\b' }   // Row 2
+};
+
+const int SPACE_PIN = 34;
+
+// ================================================================
+// SECTION 3: LAYOUT CONSTANTS
+// ================================================================
+#define TOPBAR_Y 7                // top bar divider line (compact)
+#define ICON_SIZE 6               // top bar icon size in px (was 8)
+#define LINE_HEIGHT 10            // px per text line
+#define MAX_CHARS_PER_LINE 20     // answer text chars per line (room left for scrollbar)
+#define PROMPT_LINE_HEIGHT 9      // prompt box line pitch (compact)
+#define PROMPT_MAX_LINES 3        // prompt box grows up to this many lines
+#define PROMPT_CHARS_PER_LINE 20
+
+// ================================================================
+// SECTION 4: 8x8 BITMAP ICONS
+// ================================================================
+const uint8_t wifi_connected_bmp[] PROGMEM = {
+  0b00111100, 0b01000010, 0b10011001, 0b00100100,
+  0b01000010, 0b00011000, 0b00011000, 0b00000000
+};
+
+const uint8_t wifi_disconnected_bmp[] PROGMEM = {
+  0b00111100, 0b01000010, 0b10100101, 0b00011000,
+  0b00011000, 0b10100101, 0b01000010, 0b00111100
+};
+
+const uint8_t theme_bmp[] PROGMEM = {
+  0b00111100, 0b01110010, 0b11110001, 0b11110001,
+  0b11110001, 0b11110001, 0b01110010, 0b00111100
+};
+
+void drawIcon(int x, int y, const uint8_t* bmp, int size = 8) {
+  for (int dr = 0; dr < size; dr++) {
+    int sr = (dr * 8) / size;  // nearest-neighbor downsample from the 8x8 source
+    uint8_t b = pgm_read_byte(&bmp[sr]);
+    for (int dc = 0; dc < size; dc++) {
+      int sc = (dc * 8) / size;
+      if (b & (0x80 >> sc)) {
+        u8g2.drawPixel(x + dc, y + dr);
+      }
+    }
+  }
+}
+
+// ================================================================
+// SECTION 5: GLOBAL STATE
+// ================================================================
+Preferences prefs;
+
+int wifiState = 0;  // 0=disconnected, 1=connecting, 2=connected
+bool timeSynced = false;
+unsigned long lastWifiCheck = 0;
+unsigned long lastClockUpdate = 0;
+int spinnerFrame = 0;
+
+// Only 2 icons: 0 = WiFi status, 1 = Theme toggle
+int selectedIcon = 0;
+const int iconX[2] = { 102, 114 };
+const int iconY = 0;
+
+bool invertMode = false;
+String inputBuffer = "";
+String currentStatus = "AI BOX";
+
+bool matrixKeyState[3][10] = { false };
+unsigned long matrixDebounce[3][10] = { 0 };
+bool spaceState = false;
+unsigned long spaceDebounce = 0;
+const unsigned long DEBOUNCE_MS = 30;
+
+// Answer scrolling state
+const int MAX_ANSWER_LINES = 90;
+String answerLines[MAX_ANSWER_LINES];
+int answerLineCount = 0;
+int scrollOffset = 0;      // target line index
+bool viewingAnswer = false;
+
+// Smooth pixel scrolling state
+float scrollPx = 0;         // current animated scroll position (px)
+float scrollTargetPx = 0;   // where scrollPx is animating toward (px)
+unsigned long lastScrollFrame = 0;
+
+// Dynamic prompt box state
+int promptLineCount = 1;
+String promptLines[PROMPT_MAX_LINES];
+
+// ================================================================
+// SECTION 6: FORWARD DECLARATIONS
+// ================================================================
+void connectWiFi();
+void renderScreen();
+void handleKeyPress(char k);
+void processInput(String input);
+void computePromptLines();
+int getVisibleAnswerLines();
+void updateSmoothScroll();
+
+// ================================================================
+// SECTION 7: TIME HELPER
+// ================================================================
+String getTimeString() {
+  if (!timeSynced) return "";
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo, 50)) return "";
+  char buf[6];
+  sprintf(buf, "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+  return String(buf);
+}
+
+void setDisplayInvert(bool inv) {
+  u8g2.sendF("c", inv ? 0xA7 : 0xA6);  // 0xA7=Invert, 0xA6=Normal SH1106
+}
+
+// ================================================================
+// SECTION 8: DYNAMIC PROMPT BOX
+// ================================================================
+// Wraps the current input into up to PROMPT_MAX_LINES lines. If the
+// text is longer than that, only the most recent lines are kept
+// visible (like a scrolling single-line-growing-to-multiline input).
+void computePromptLines() {
+  String full = ">" + inputBuffer + "_";
+  int totalLen = full.length();
+  int totalLines = (totalLen + PROMPT_CHARS_PER_LINE - 1) / PROMPT_CHARS_PER_LINE;
+  if (totalLines < 1) totalLines = 1;
+
+  int startChar = 0;
+  if (totalLines > PROMPT_MAX_LINES) {
+    startChar = totalLen - PROMPT_MAX_LINES * PROMPT_CHARS_PER_LINE;
+    if (startChar < 0) startChar = 0;
+  }
+
+  promptLineCount = 0;
+  int i = startChar;
+  while (i < totalLen && promptLineCount < PROMPT_MAX_LINES) {
+    int len = min(PROMPT_CHARS_PER_LINE, totalLen - i);
+    promptLines[promptLineCount++] = full.substring(i, i + len);
+    i += len;
+  }
+  if (promptLineCount < 1) promptLineCount = 1;
+}
+
+int promptDividerY() {
+  return 64 - (promptLineCount * PROMPT_LINE_HEIGHT + 1);
+}
+
+int contentTopY() {
+  return TOPBAR_Y + 11;
+}
+
+int getVisibleAnswerLines() {
+  computePromptLines();
+  int vis = (promptDividerY() - contentTopY()) / LINE_HEIGHT;
+  if (vis < 1) vis = 1;
+  return vis;
+}
+
+// ================================================================
+// SECTION 9: FULL SCREEN RENDERER (U8G2 BUFFER)
+// ================================================================
+void renderScreen() {
+  computePromptLines();
+  int dividerY = promptDividerY();
+
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  // ----------------- TOP BAR (compact) -----------------
+  u8g2.setFont(u8g2_font_5x7_tf);  // smaller font just for the top bar
+
+  String t = getTimeString();
+  if (t.length() > 0) {
+    u8g2.drawStr(1, TOPBAR_Y - 1, t.c_str());
+  } else {
+    u8g2.drawStr(1, TOPBAR_Y - 1, "AI");
+  }
+
+  // Status text is right-aligned against the icons so it can never
+  // run into the clock, however long "Connecting..." etc gets.
+  int statusW = u8g2.getStrWidth(currentStatus.c_str());
+  int statusX = iconX[0] - 5 - statusW;
+  if (statusX < 26) statusX = 26;  // never overlap the time on the left
+  u8g2.drawStr(statusX, TOPBAR_Y - 1, currentStatus.c_str());
+
+  if (wifiState == 2) {
+    drawIcon(iconX[0], iconY, wifi_connected_bmp, ICON_SIZE);
+  } else if (wifiState == 1) {
+    int animX = iconX[0] + (spinnerFrame % 4) * 2;
+    u8g2.drawPixel(animX, iconY + 3);
+    u8g2.drawPixel(animX + 1, iconY + 3);
+  } else {
+    drawIcon(iconX[0], iconY, wifi_disconnected_bmp, ICON_SIZE);
+  }
+
+  drawIcon(iconX[1], iconY, theme_bmp, ICON_SIZE);
+
+  u8g2.drawFrame(iconX[selectedIcon] - 1, 0, ICON_SIZE + 2, TOPBAR_Y);
+  u8g2.drawHLine(0, TOPBAR_Y, 128);
+
+  u8g2.setFont(u8g2_font_6x10_tf);  // back to the normal font for content/prompt
+
+  // ----------------- CONTENT AREA (answer, smooth scrolled) -----------------
+  if (viewingAnswer) {
+    int cTop = contentTopY();
+    u8g2.setClipWindow(0, TOPBAR_Y + 1, 125, dividerY - 1);
+
+    int baseLineIndex = (int)floor(scrollPx / LINE_HEIGHT);
+    float fracOffset = scrollPx - baseLineIndex * LINE_HEIGHT;
+    int linesToDraw = ((dividerY - cTop) / LINE_HEIGHT) + 3;
+
+    for (int i = -1; i <= linesToDraw; i++) {
+      int idx = baseLineIndex + i;
+      if (idx >= 0 && idx < answerLineCount) {
+        int y = cTop + i * LINE_HEIGHT - (int)fracOffset;
+        if (y > TOPBAR_Y - LINE_HEIGHT && y < dividerY + LINE_HEIGHT) {
+          u8g2.drawStr(2, y, answerLines[idx].c_str());
+        }
+      }
+    }
+    u8g2.setMaxClipWindow();
+
+    // Scrollbar (only if content taller than the viewport)
+    float totalContentPx = answerLineCount * LINE_HEIGHT;
+    float viewPx = dividerY - cTop;
+    if (totalContentPx > viewPx) {
+      int trackTop = TOPBAR_Y + 2;
+      int trackBottom = dividerY - 2;
+      int trackH = trackBottom - trackTop;
+      if (trackH < 4) trackH = 4;
+      int thumbH = (int)(trackH * (viewPx / totalContentPx));
+      if (thumbH < 4) thumbH = 4;
+      float maxScrollPx = totalContentPx - viewPx;
+      float scrollRatio = (maxScrollPx > 0) ? (scrollPx / maxScrollPx) : 0;
+      if (scrollRatio < 0) scrollRatio = 0;
+      if (scrollRatio > 1) scrollRatio = 1;
+      int thumbY = trackTop + (int)((trackH - thumbH) * scrollRatio);
+      for (int y = thumbY; y < thumbY + thumbH; y++) {
+        u8g2.drawPixel(126, y);
+        u8g2.drawPixel(127, y);
+      }
+    }
+  }
+
+  // ----------------- PROMPT BOX (BOTTOM, dynamic height) -----------------
+  u8g2.drawHLine(0, dividerY, 128);
+  for (int i = 0; i < promptLineCount; i++) {
+    int baseline = dividerY + 8 + i * PROMPT_LINE_HEIGHT;
+    u8g2.drawStr(1, baseline, promptLines[i].c_str());
+  }
+
+  u8g2.sendBuffer();
+}
+
+// ================================================================
+// SECTION 10: SMOOTH SCROLL ANIMATION
+// ================================================================
+void updateSmoothScroll() {
+  if (!viewingAnswer) {
+    scrollPx = scrollTargetPx;
+    return;
+  }
+  if (fabs(scrollTargetPx - scrollPx) < 0.3f) {
+    if (scrollPx != scrollTargetPx) {
+      scrollPx = scrollTargetPx;
+      renderScreen();
+    }
+    return;
+  }
+  if (millis() - lastScrollFrame < 16) return;  // ~60fps cap
+  lastScrollFrame = millis();
+  scrollPx += (scrollTargetPx - scrollPx) * 0.3f;  // easing
+  renderScreen();
+}
+
+// ================================================================
+// SECTION 11: QUESTION & ANSWER PROCESSING
+// ================================================================
+void showQuestion(String q) {
+  viewingAnswer = false;
+  u8g2.clearBuffer();
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  // Top Bar
+  u8g2.setFont(u8g2_font_5x7_tf);
+  u8g2.drawStr(1, TOPBAR_Y - 1, "AI ASSISTANT");
+  u8g2.drawHLine(0, TOPBAR_Y, 128);
+  u8g2.setFont(u8g2_font_6x10_tf);
+
+  // Question preview
+  u8g2.drawStr(2, 22, "Q:");
+  int len1 = min((int)q.length(), 18);
+  u8g2.drawStr(16, 22, q.substring(0, len1).c_str());
+  if ((int)q.length() > 18) {
+    u8g2.drawStr(2, 33, q.substring(18, min((int)q.length(), 38)).c_str());
+  }
+
+  u8g2.drawStr(2, 47, "[ Thinking... ]");
+  u8g2.drawHLine(0, 51, 128);
+  u8g2.drawStr(1, 61, ">_");
+  u8g2.sendBuffer();
+}
+
+void wrapAnswerText(String text) {
+  answerLineCount = 0;
+  int i = 0;
+
+  while (i < (int)text.length() && answerLineCount < MAX_ANSWER_LINES) {
+    int lineLen = min(MAX_CHARS_PER_LINE, (int)text.length() - i);
+    if (i + lineLen < (int)text.length()) {
+      int lastSpace = text.lastIndexOf(' ', i + lineLen);
+      if (lastSpace > i) lineLen = lastSpace - i;
+    }
+    String line = text.substring(i, i + lineLen);
+    line.trim();
+    if (line.length() > 0) {
+      answerLines[answerLineCount++] = line;
+    }
+    i += lineLen;
+    while (i < (int)text.length() && text.charAt(i) == ' ') i++;
+  }
+}
+
+void showAnswer(String a) {
+  wrapAnswerText(a);
+  scrollOffset = 0;
+  scrollPx = 0;
+  scrollTargetPx = 0;
+  viewingAnswer = true;
+  renderScreen();
+}
+
+void scrollAnswerUp() {
+  if (scrollOffset > 0) {
+    scrollOffset--;
+    scrollTargetPx = scrollOffset * LINE_HEIGHT;
+  }
+}
+
+void scrollAnswerDown() {
+  int vis = getVisibleAnswerLines();
+  if (scrollOffset + vis < answerLineCount) {
+    scrollOffset++;
+    scrollTargetPx = scrollOffset * LINE_HEIGHT;
+  }
+}
+
+// ================================================================
+// SECTION 12: ICON ACTIONS
+// ================================================================
+void activateSelected() {
+  if (selectedIcon == 0) {
+    if (wifiState != 2) connectWiFi();
+  } else if (selectedIcon == 1) {
+    invertMode = !invertMode;
+    setDisplayInvert(invertMode);
+    prefs.begin("app-settings", false);
+    prefs.putBool("invert", invertMode);
+    prefs.end();
+  }
+  renderScreen();
+}
+
+// ================================================================
+// SECTION 13: WIFI & TIME MANAGEMENT
+// ================================================================
+void connectWiFi() {
+  wifiState = 1;
+  currentStatus = "Conn...";
+  renderScreen();
+
+  // --- Hotspot-reliability fixes ---
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(true, true);   // clear ESP32's own stored/auto-reconnect network
+  delay(200);
+  WiFi.persistent(false);        // don't let WiFi driver save/reuse old networks
+  WiFi.setSleep(false);          // avoid modem-sleep drops with phone hotspots
+
+  Serial.print("Connecting to: ");
+  Serial.println(DEFAULT_SSID);
+
+  WiFi.begin(DEFAULT_SSID, DEFAULT_PASSWORD);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 40) {
+    delay(300);
+    spinnerFrame++;
+    renderScreen();
+    Serial.print(".");
+    attempts++;
+  }
+  Serial.println();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiState = 2;
+    currentStatus = "Ready";
+    Serial.print("Connected! IP: ");
+    Serial.println(WiFi.localIP());
+    configTime(GMT_OFFSET_SEC, 0, "pool.ntp.org", "time.google.com");
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 4000)) timeSynced = true;
+  } else {
+    wifiState = 0;
+    currentStatus = "No WiFi";
+    Serial.print("WiFi failed, status code: ");
+    Serial.println(WiFi.status());
+  }
+
+  renderScreen();
+}
+
+void checkWifiStatusLive() {
+  if (millis() - lastWifiCheck > 4000) {
+    lastWifiCheck = millis();
+    bool nowConnected = (WiFi.status() == WL_CONNECTED);
+    int newState = nowConnected ? 2 : 0;
+    if (newState != wifiState && wifiState != 1) {
+      wifiState = newState;
+      currentStatus = (wifiState == 2) ? "Ready" : "Offline";
+      renderScreen();
+    }
+  }
+}
+
+void updateClockDisplay() {
+  if (millis() - lastClockUpdate > 1000) {
+    lastClockUpdate = millis();
+    if (timeSynced) {
+      renderScreen();
+    }
+  }
+}
+
+// ================================================================
+// SECTION 14: AI API CALL (OpenRouter)
+// ================================================================
+String askAI(String question) {
+  WiFiClientSecure client;
+  client.setInsecure();
+
+  HTTPClient https;
+  https.setTimeout(25000);
+
+  if (!https.begin(client, OPENROUTER_URL)) return "Err: API conn failed";
+
+  https.addHeader("Content-Type", "application/json");
+  https.addHeader("Authorization", String("Bearer ") + OPENROUTER_KEY);
+  https.addHeader("HTTP-Referer", "https://esp32-ai-box.local");
+  https.addHeader("X-Title", "ESP32 AI Box");
+
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonDocument requestDoc;
+  requestDoc["model"] = MODEL_NAME;
+  requestDoc["max_tokens"] = 900;
+  JsonArray messages = requestDoc["messages"].to<JsonArray>();
+
+  JsonObject systemMsg = messages.add<JsonObject>();
+  systemMsg["role"] = "system";
+  systemMsg["content"] = "You are an AI assistant. Give clear answers up to 900 characters. Plain text only, no markdown, no emojis.";
+
+  JsonObject userMsg = messages.add<JsonObject>();
+  userMsg["role"] = "user";
+  userMsg["content"] = question;
+#else
+  StaticJsonDocument<2048> requestDoc;
+  requestDoc["model"] = MODEL_NAME;
+  requestDoc["max_tokens"] = 900;
+  JsonArray messages = requestDoc.createNestedArray("messages");
+
+  JsonObject systemMsg = messages.createNestedObject();
+  systemMsg["role"] = "system";
+  systemMsg["content"] = "You are an AI assistant. Give clear answers up to 900 characters. Plain text only, no markdown, no emojis.";
+
+  JsonObject userMsg = messages.createNestedObject();
+  userMsg["role"] = "user";
+  userMsg["content"] = question;
+#endif
+
+  String requestBody;
+  serializeJson(requestDoc, requestBody);
+
+  int httpCode = https.POST(requestBody);
+  String result;
+
+  if (httpCode == 200) {
+    String response = https.getString();
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+    JsonDocument responseDoc;
+#else
+    StaticJsonDocument<6144> responseDoc;
+#endif
+    DeserializationError error = deserializeJson(responseDoc, response);
+    if (error) {
+      result = "JSON err: " + String(error.c_str());
+    } else {
+      result = responseDoc["choices"][0]["message"]["content"].as<String>();
+      result.trim();
+    }
+  } else {
+    result = "HTTP err: " + String(httpCode);
+  }
+
+  https.end();
+  return result;
+}
+
+// ================================================================
+// SECTION 15: PROCESS USER INPUT
+// ================================================================
+void processInput(String input) {
+  input.trim();
+  String cmdLower = input;
+  cmdLower.toLowerCase();
+
+  if (cmdLower == "left") {
+    selectedIcon = (selectedIcon + 1) % 2;
+    renderScreen();
+  } else if (cmdLower == "right") {
+    selectedIcon = (selectedIcon + 1) % 2;
+    renderScreen();
+  } else if (cmdLower == "ok") {
+    activateSelected();
+  } else if (input.length() > 0) {
+    showQuestion(input);
+    currentStatus = "Think..";
+
+    String answer = askAI(input);
+
+    currentStatus = "Ready";
+    showAnswer(answer);
+  }
+}
+
+// ================================================================
+// SECTION 16: KEY HANDLING (Matrix & Serial)
+// ================================================================
+void handleKeyPress(char k) {
+  if (inputBuffer.length() == 0 && k == ',') {
+    if (viewingAnswer) {
+      scrollAnswerUp();
+    } else {
+      selectedIcon = (selectedIcon + 1) % 2;
+      renderScreen();
+    }
+  } else if (inputBuffer.length() == 0 && k == '.') {
+    if (viewingAnswer) {
+      scrollAnswerDown();
+    } else {
+      selectedIcon = (selectedIcon + 1) % 2;
+      renderScreen();
+    }
+  } else if (k == '\b') {
+    if (inputBuffer.length() > 0) {
+      inputBuffer.remove(inputBuffer.length() - 1);
+    }
+    renderScreen();
+  } else if (k == '\n') {
+    String finalized = inputBuffer;
+    inputBuffer = "";
+    if (finalized.length() == 0) {
+      activateSelected();
+    } else {
+      processInput(finalized);
+    }
+  } else {
+    if (viewingAnswer) {
+      viewingAnswer = false;
+    }
+    inputBuffer += k;
+    renderScreen();
+  }
+}
+
+// ================================================================
+// SECTION 17: KEYBOARD SCANNING
+// ================================================================
+void checkMatrix() {
+  for (int r = 0; r < 3; r++) {
+    digitalWrite(ROW_PINS[r], LOW);
+    delayMicroseconds(50);
+
+    for (int c = 0; c < 10; c++) {
+      bool pressed = (digitalRead(COL_PINS[c]) == LOW);
+
+      if (pressed != matrixKeyState[r][c]) {
+        if (millis() - matrixDebounce[r][c] > DEBOUNCE_MS) {
+          matrixKeyState[r][c] = pressed;
+          matrixDebounce[r][c] = millis();
+
+          if (pressed) {
+            handleKeyPress(keyMap[r][c]);
+          }
+        }
+      }
+    }
+
+    digitalWrite(ROW_PINS[r], HIGH);
+  }
+}
+
+void checkSpaceSwitch() {
+  bool pressed = (digitalRead(SPACE_PIN) == LOW);
+  if (pressed != spaceState) {
+    if (millis() - spaceDebounce > DEBOUNCE_MS) {
+      spaceState = pressed;
+      spaceDebounce = millis();
+      if (pressed) {
+        handleKeyPress(' ');
+      }
+    }
+  }
+}
+
+// ================================================================
+// SECTION 18: SETUP
+// ================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+
+  // Initialize U8g2 Display
+  u8g2.begin();
+
+  // Keyboard Rows as Output HIGH
+  for (int r = 0; r < 3; r++) {
+    pinMode(ROW_PINS[r], OUTPUT);
+    digitalWrite(ROW_PINS[r], HIGH);
+  }
+  // Keyboard Cols as Input Pullup
+  for (int c = 0; c < 10; c++) {
+    pinMode(COL_PINS[c], INPUT_PULLUP);
+  }
+  // Space Switch
+  pinMode(SPACE_PIN, INPUT);
+
+  // Read saved Theme (Invert)
+  prefs.begin("app-settings", true);
+  invertMode = prefs.getBool("invert", false);
+  prefs.end();
+  if (invertMode) setDisplayInvert(true);
+
+  renderScreen();
+  connectWiFi();
+}
+
+// ================================================================
+// SECTION 19: MAIN LOOP
+// ================================================================
+void loop() {
+  checkWifiStatusLive();
+  updateClockDisplay();
+  updateSmoothScroll();
+  checkMatrix();
+  checkSpaceSwitch();
+
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c == 8 || c == 127) c = '\b';
+    handleKeyPress(c);
+  }
+}
